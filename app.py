@@ -1,30 +1,194 @@
-import streamlit as st
-import sqlite3
 import json
-import requests
+import os
+import re
+import sqlite3
+import time
 from datetime import datetime
+
+import requests
+import streamlit as st
 from google import genai
 from google.genai import types
 
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# ============================================================
+# APP CONFIGURATION
+# ============================================================
 
-APP_TITLE = "Agentic Work Intake & Execution Prototype"
+st.set_page_config(
+    page_title="Agentic Work Intake & Execution Prototype",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ============================================================
+# GEMINI CONFIGURATION
+# ============================================================
+
+# Primary model first, then fallback models.
+# These are current stable model IDs documented by Google.
+GEMINI_MODELS = [
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+]
+
 DB_NAME = "agent_system.db"
-GEMINI_MODEL = "gemini-3.7-flash"
 
 
-# =============================================================================
-# 1. DATABASE & STATE PERSISTENCE
-# =============================================================================
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
+
+SYSTEM_PROMPT = """
+You are an Agentic Work Intake and Execution Planner.
+
+Your job is to analyze unstructured business work such as:
+- emails
+- meeting notes
+- customer requests
+- founder instructions
+- internal work requests
+
+Convert the input into a structured, actionable workflow.
+
+You must determine:
+
+1. What the user is asking for.
+2. The category of work.
+3. The priority.
+4. Whether the request can be executed automatically.
+5. Whether human approval is required.
+6. Whether a tool/capability is required.
+7. Whether important information is missing.
+8. What action should be taken.
+9. What information should be presented to a human reviewer.
+
+Routing rules:
+
+- "execute_automatically"
+  Use when the task is safe and sufficiently clear to execute automatically.
+
+- "prepare_for_human_review"
+  Use when a human must approve, review, or make a decision before execution.
+
+- "cannot_execute_with_tools"
+  Use when the requested task requires a capability/tool that this prototype does not have.
+
+- "requires_clarification"
+  Use when important information is missing and execution cannot safely proceed.
+
+Examples:
+
+A simple request to summarize or classify information:
+-> execute_automatically
+
+A request to send money, approve a contract, make an important external decision,
+or perform a consequential action:
+-> prepare_for_human_review
+
+A request requiring an unavailable external system:
+-> cannot_execute_with_tools
+
+A request where the destination, amount, recipient, date, or other critical information
+is missing:
+-> requires_clarification
+
+Never invent missing information.
+
+Return ONLY valid JSON matching the requested schema.
+"""
+
+
+# ============================================================
+# STRUCTURED OUTPUT SCHEMA
+# ============================================================
+
+AGENT_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "summary": {
+            "type": "STRING"
+        },
+        "intent": {
+            "type": "STRING"
+        },
+        "category": {
+            "type": "STRING"
+        },
+        "priority": {
+            "type": "STRING",
+            "enum": [
+                "low",
+                "medium",
+                "high",
+                "critical"
+            ]
+        },
+        "route": {
+            "type": "STRING",
+            "enum": [
+                "execute_automatically",
+                "prepare_for_human_review",
+                "cannot_execute_with_tools",
+                "requires_clarification"
+            ]
+        },
+        "action": {
+            "type": "STRING"
+        },
+        "reason": {
+            "type": "STRING"
+        },
+        "missing_information": {
+            "type": "ARRAY",
+            "items": {
+                "type": "STRING"
+            }
+        },
+        "required_tools": {
+            "type": "ARRAY",
+            "items": {
+                "type": "STRING"
+            }
+        },
+        "approval_required": {
+            "type": "BOOLEAN"
+        },
+        "execution_result": {
+            "type": "STRING"
+        }
+    },
+    "required": [
+        "summary",
+        "intent",
+        "category",
+        "priority",
+        "route",
+        "action",
+        "reason",
+        "missing_information",
+        "required_tools",
+        "approval_required",
+        "execution_result"
+    ]
+}
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 def get_db_connection():
     """
-    Return a SQLite connection with a timeout.
-    check_same_thread=False helps Streamlit's execution model.
+    Return a SQLite connection.
+
+    timeout helps reduce temporary database locking problems.
+    check_same_thread=False makes the connection safer for Streamlit usage.
     """
+
     return sqlite3.connect(
         DB_NAME,
         timeout=15,
@@ -33,569 +197,635 @@ def get_db_connection():
 
 
 def init_db():
-    """
-    Create all required tables.
-
-    Also performs a small migration for existing databases so that
-    older agent_system.db files continue to work.
-    """
 
     with get_db_connection() as conn:
+
         cursor = conn.cursor()
 
-        # ---------------------------------------------------------------------
-        # Requests table
-        # ---------------------------------------------------------------------
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                raw_text TEXT,
-                structured_json TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-
-        # ---------------------------------------------------------------------
-        # Actions table
-        # ---------------------------------------------------------------------
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS actions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                request_id INTEGER,
-                action_title TEXT,
-                action_type TEXT,
-                routing_category TEXT,
+                created_at TEXT NOT NULL,
+                input_text TEXT NOT NULL,
+                summary TEXT,
+                intent TEXT,
+                category TEXT,
+                priority TEXT,
+                route TEXT,
+                action TEXT,
                 reason TEXT,
-                status TEXT,
-                output TEXT,
-                FOREIGN KEY(request_id) REFERENCES requests(id)
+                missing_information TEXT,
+                required_tools TEXT,
+                approval_required INTEGER,
+                execution_result TEXT,
+                model_used TEXT,
+                status TEXT
             )
             """
         )
 
-        # ---------------------------------------------------------------------
-        # Activity logs table
-        # ---------------------------------------------------------------------
         cursor.execute(
             """
-            CREATE TABLE IF NOT EXISTS activity_logs (
+            CREATE TABLE IF NOT EXISTS activity_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME,
-                event_type TEXT,
-                details TEXT
+                created_at TEXT NOT NULL,
+                request_id INTEGER,
+                event_type TEXT NOT NULL,
+                message TEXT NOT NULL
             )
             """
         )
 
-        # ---------------------------------------------------------------------
-        # Database migration
-        #
-        # We use the existing "output" column to store pending execution
-        # parameters, so no additional column is strictly required.
-        #
-        # This check simply confirms the expected columns exist.
-        # ---------------------------------------------------------------------
-        cursor.execute("PRAGMA table_info(actions)")
-        existing_columns = {
-            row[1] for row in cursor.fetchall()
-        }
-
-        expected_columns = {
-            "request_id",
-            "action_title",
-            "action_type",
-            "routing_category",
-            "reason",
-            "status",
-            "output"
-        }
-
-        missing_columns = expected_columns - existing_columns
-
-        if missing_columns:
-            # This should normally never happen because CREATE TABLE above
-            # handles new installations.
-            pass
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS approvals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                decision TEXT,
+                reviewer TEXT,
+                comment TEXT
+            )
+            """
+        )
 
         conn.commit()
 
 
-def log_activity(event_type, details, cursor=None):
-    """
-    Add an activity trace.
-
-    If a cursor is supplied, use the same database transaction.
-    Otherwise create a separate connection.
-    """
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if cursor is not None:
-        cursor.execute(
-            """
-            INSERT INTO activity_logs
-            (timestamp, event_type, details)
-            VALUES (?, ?, ?)
-            """,
-            (
-                timestamp,
-                event_type,
-                details
-            )
-        )
-    else:
-        with get_db_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO activity_logs
-                (timestamp, event_type, details)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    timestamp,
-                    event_type,
-                    details
-                )
-            )
-            conn.commit()
-
-
-# Initialize database when application starts
+# Initialize database when application starts.
 init_db()
 
 
-# =============================================================================
-# 2. AGENT TOOLS
-# =============================================================================
+# ============================================================
+# ACTIVITY LOG
+# ============================================================
 
-def check_website_status(url: str) -> str:
-    """
-    Tool 1:
-    Check whether a website is reachable.
-    """
+def log_activity(
+    event_type,
+    message,
+    request_id=None
+):
 
-    if not url:
-        return json.dumps({
-            "reachable": False,
-            "error": "No URL provided."
-        })
+    with get_db_connection() as conn:
 
-    url = url.strip()
+        cursor = conn.cursor()
 
-    if not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
-
-    try:
-        response = requests.get(
-            url,
-            timeout=8,
-            allow_redirects=True
+        cursor.execute(
+            """
+            INSERT INTO activity_log (
+                created_at,
+                request_id,
+                event_type,
+                message
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                request_id,
+                event_type,
+                message
+            )
         )
 
-        return json.dumps({
-            "url": url,
-            "final_url": response.url,
-            "status_code": response.status_code,
-            "reachable": 200 <= response.status_code < 400,
-            "response_time_seconds": round(
-                response.elapsed.total_seconds(),
-                2
-            )
-        })
-
-    except requests.RequestException as e:
-        return json.dumps({
-            "url": url,
-            "reachable": False,
-            "error": f"Failed to connect: {str(e)}"
-        })
-
-    except Exception as e:
-        return json.dumps({
-            "url": url,
-            "reachable": False,
-            "error": str(e)
-        })
+        conn.commit()
 
 
-def create_task_record(
-    title: str,
-    deadline: str,
-    priority: str
-) -> str:
-    """
-    Tool 2:
-    Create a task record.
+def get_activity_logs(limit=30):
 
-    In this prototype, the tool returns a structured confirmation.
-    """
+    with get_db_connection() as conn:
 
-    title = title or "Untitled Task"
-    deadline = deadline or "None specified"
-    priority = priority or "Medium"
+        cursor = conn.cursor()
 
-    return json.dumps({
-        "status": "CREATED",
-        "task_title": title,
-        "deadline": deadline,
-        "priority": priority,
-        "saved_at": datetime.now().isoformat()
-    })
+        cursor.execute(
+            """
+            SELECT
+                created_at,
+                event_type,
+                message
+            FROM activity_log
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,)
+        )
+
+        return cursor.fetchall()
 
 
-def draft_communication(
-    recipient: str,
-    subject: str,
-    body: str
-) -> str:
-    """
-    Tool 3:
-    Create a communication draft.
-    """
+# ============================================================
+# API KEY
+# ============================================================
 
-    recipient = recipient.strip() if recipient else ""
+def get_gemini_api_key():
 
-    if not recipient:
-        recipient_display = "FLAGGED_MISSING_RECIPIENT"
-    else:
-        recipient_display = recipient
+    # Streamlit Cloud Secrets
+    try:
 
-    return json.dumps({
-        "status": "DRAFT_SAVED",
-        "recipient": recipient_display,
-        "subject": subject or "No subject",
-        "body": body or "",
-        "body_preview": (
-            body[:150] + "..."
-            if body and len(body) > 150
-            else body or ""
-        ),
-        "saved_at": datetime.now().isoformat()
-    })
+        if "GEMINI_API_KEY" in st.secrets:
+
+            key = st.secrets["GEMINI_API_KEY"]
+
+            if key:
+                return str(key).strip()
+
+    except Exception:
+        pass
+
+    # Local environment variable fallback
+    key = os.getenv("GEMINI_API_KEY")
+
+    if key:
+        return key.strip()
+
+    return None
 
 
-# =============================================================================
-# 3. GEMINI AGENTIC PLANNING
-# =============================================================================
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
-SYSTEM_PROMPT = """
-You are an Agentic Work Intake Engine.
+def safe_json_loads(text):
 
-Your job is to analyze unstructured work instructions such as:
+    if not text:
+        raise ValueError("Gemini returned an empty response.")
 
-- emails
-- meeting notes
-- customer requests
-- founder instructions
-- operational requests
+    text = text.strip()
 
-You must convert the input into structured JSON.
+    # Remove markdown JSON fences if the model ever returns them.
+    text = re.sub(
+        r"^```json\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
 
-You have exactly these three tools:
+    text = re.sub(
+        r"^```\s*",
+        "",
+        text
+    )
 
-1. check_website_status
-   - Checks whether a website is reachable.
-   - Safe to execute automatically.
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text
+    )
 
-2. create_task_record
-   - Creates a task record.
-   - Requires human approval before execution.
-
-3. draft_communication
-   - Creates an email/message draft.
-   - Requires human approval before execution.
-
-You must route every action into exactly one of these categories:
-
-1. execute_automatically
-   Safe actions that can run immediately.
-
-2. prepare_for_human_review
-   Actions that should wait for human approval.
-
-3. cannot_execute_with_tools
-   Valid requests that cannot be performed by the available tools.
-
-4. requires_clarification
-   Requests missing important information.
-
-Important rules:
-
-- Never invent missing information.
-- If a recipient is required but missing, use requires_clarification.
-- If a URL is explicitly present, use it.
-- Do not invent a URL.
-- If the user asks to check a website, use check_website_status.
-- Creating a task requires human approval.
-- Drafting communication requires human approval.
-- Explain briefly why an action was routed to its category.
-
-Return ONLY valid JSON matching the supplied schema.
-"""
+    return json.loads(text)
 
 
-# JSON schema for Gemini structured output
-AGENT_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "task_title": {
-            "type": "string"
-        },
-        "summary": {
-            "type": "string"
-        },
-        "priority": {
-            "type": "string",
-            "enum": [
-                "High",
-                "Medium",
-                "Low"
-            ]
-        },
-        "detected_deadline": {
-            "type": "string"
-        },
-        "missing_information": {
-            "type": "string"
-        },
-        "actions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "action_title": {
-                        "type": "string"
-                    },
-                    "tool_to_use": {
-                        "type": "string",
-                        "enum": [
-                            "check_website_status",
-                            "create_task_record",
-                            "draft_communication",
-                            "none"
-                        ]
-                    },
-                    "routing_category": {
-                        "type": "string",
-                        "enum": [
-                            "execute_automatically",
-                            "prepare_for_human_review",
-                            "cannot_execute_with_tools",
-                            "requires_clarification"
-                        ]
-                    },
-                    "reason": {
-                        "type": "string"
-                    },
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "url": {
-                                "type": "string"
-                            },
-                            "title": {
-                                "type": "string"
-                            },
-                            "deadline": {
-                                "type": "string"
-                            },
-                            "priority": {
-                                "type": "string"
-                            },
-                            "recipient": {
-                                "type": "string"
-                            },
-                            "subject": {
-                                "type": "string"
-                            },
-                            "body": {
-                                "type": "string"
-                            }
-                        }
-                    }
-                },
-                "required": [
-                    "action_title",
-                    "tool_to_use",
-                    "routing_category",
-                    "reason",
-                    "parameters"
-                ]
-            }
-        }
-    },
-    "required": [
-        "task_title",
-        "summary",
-        "priority",
-        "detected_deadline",
-        "missing_information",
-        "actions"
+def is_transient_error(error):
+
+    error_text = str(error).lower()
+
+    transient_markers = [
+        "503",
+        "unavailable",
+        "service unavailable",
+        "high demand",
+        "temporarily",
+        "429",
+        "resource exhausted",
+        "rate limit",
+        "500",
+        "internal server error",
+        "502",
+        "504",
+        "deadline exceeded"
     ]
-}
 
+    return any(
+        marker in error_text
+        for marker in transient_markers
+    )
+
+
+# ============================================================
+# GEMINI AGENT
+# ============================================================
 
 def process_intake_with_llm(
-    text: str,
-    api_key: str
+    text,
+    api_key
 ):
     """
-    Send unstructured work to Gemini and receive structured JSON.
+    Process unstructured work with Gemini.
 
-    Uses the current Google GenAI SDK and Gemini 3.7 Flash.
+    Strategy:
+
+    Model 1
+       ↓
+    transient error?
+       ↓
+    retry with exponential backoff
+       ↓
+    still unavailable?
+       ↓
+    Model 2
+       ↓
+    Model 3
     """
 
     if not api_key:
-        raise ValueError("Gemini API key is missing.")
+
+        raise ValueError(
+            "Gemini API key is missing. "
+            "Configure GEMINI_API_KEY in Streamlit Secrets."
+        )
 
     client = genai.Client(
         api_key=api_key
     )
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=text,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=AGENT_RESPONSE_SCHEMA
+    last_error = None
+
+    for model_name in GEMINI_MODELS:
+
+        log_activity(
+            "MODEL_ATTEMPT",
+            f"Trying Gemini model: {model_name}"
         )
+
+        # Maximum of 3 attempts for each model.
+        for attempt in range(3):
+
+            try:
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=text,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        response_mime_type="application/json",
+                        response_schema=AGENT_RESPONSE_SCHEMA,
+                    )
+                )
+
+                if not response.text:
+
+                    raise RuntimeError(
+                        f"{model_name} returned an empty response."
+                    )
+
+                result = safe_json_loads(
+                    response.text
+                )
+
+                # Store model information internally.
+                result["_model_used"] = model_name
+
+                log_activity(
+                    "MODEL_SUCCESS",
+                    f"Successfully processed using {model_name}"
+                )
+
+                return result
+
+            except Exception as error:
+
+                last_error = error
+
+                log_activity(
+                    "MODEL_ERROR",
+                    (
+                        f"{model_name} attempt "
+                        f"{attempt + 1}/3 failed: {error}"
+                    )
+                )
+
+                # Only retry temporary server/rate-limit errors.
+                if is_transient_error(error):
+
+                    if attempt < 2:
+
+                        wait_seconds = 2 ** attempt
+
+                        # Small additional jitter.
+                        time.sleep(
+                            wait_seconds
+                        )
+
+                        continue
+
+                    # Three attempts failed.
+                    # Move to the next model.
+                    break
+
+                # Authentication, bad request, invalid schema, etc.
+                # should NOT silently move through all models.
+                raise
+
+    raise RuntimeError(
+        "All Gemini models are temporarily unavailable. "
+        f"Last error: {last_error}"
     )
 
-    if not response.text:
-        raise RuntimeError(
-            "Gemini returned an empty response."
-        )
 
-    try:
-        return json.loads(response.text)
+# ============================================================
+# TOOL EXECUTION
+# ============================================================
 
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"Gemini returned invalid JSON: {e}\n\n"
-            f"Raw response:\n{response.text}"
-        )
-
-
-# =============================================================================
-# 4. HELPER FUNCTIONS
-# =============================================================================
-
-def execute_action(
-    tool_name,
-    params
+def execute_available_tools(
+    input_text,
+    agent_result
 ):
     """
-    Execute one of the three available tools.
+    Very small safe tool layer for the prototype.
+
+    Currently supports basic URL reachability checking.
     """
 
-    params = params or {}
+    required_tools = agent_result.get(
+        "required_tools",
+        []
+    )
 
-    if tool_name == "check_website_status":
-        return check_website_status(
-            params.get("url", "")
-        )
+    if not required_tools:
+        return "No external tool was required."
 
-    if tool_name == "create_task_record":
-        return create_task_record(
-            title=params.get("title", ""),
-            deadline=params.get("deadline", ""),
-            priority=params.get("priority", "")
-        )
+    # Find URLs in the original request.
+    urls = re.findall(
+        r"https?://[^\s<>\"]+",
+        input_text
+    )
 
-    if tool_name == "draft_communication":
-        return draft_communication(
-            recipient=params.get("recipient", ""),
-            subject=params.get("subject", ""),
-            body=params.get("body", "")
-        )
+    if urls:
 
-    return json.dumps({
-        "status": "NO_TOOL",
-        "message": "No executable tool selected."
-    })
+        results = []
 
+        for url in urls[:3]:
 
-def safe_json_loads(value, default=None):
-    """
-    Safely parse JSON stored in SQLite.
-    """
+            try:
 
-    if not value:
-        return default if default is not None else {}
+                response = requests.get(
+                    url,
+                    timeout=10,
+                    allow_redirects=True
+                )
 
-    try:
-        return json.loads(value)
-    except Exception:
-        return default if default is not None else {}
+                results.append(
+                    f"{url} -> HTTP {response.status_code}"
+                )
 
+            except requests.RequestException as error:
 
-def get_api_key():
-    """
-    Get Gemini API key.
+                results.append(
+                    f"{url} -> request failed: {error}"
+                )
 
-    Priority:
-    1. Streamlit Secrets
-    2. Manual sidebar input
+        return "\n".join(results)
 
-    This makes the same app work locally and on Streamlit Cloud.
-    """
-
-    secret_key = ""
-
-    try:
-        secret_key = st.secrets.get(
-            "GEMINI_API_KEY",
-            ""
-        )
-    except Exception:
-        secret_key = ""
-
-    if secret_key:
-        return secret_key
-
-    return st.session_state.get(
-        "manual_gemini_api_key",
-        ""
+    return (
+        "The requested tool/capability is not implemented "
+        "in this prototype."
     )
 
 
-# =============================================================================
-# 5. STREAMLIT PAGE CONFIGURATION
-# =============================================================================
+# ============================================================
+# SAVE REQUEST
+# ============================================================
 
-st.set_page_config(
-    page_title="Work Intake Agent Prototype",
-    page_icon="⚡",
-    layout="wide"
-)
+def save_request(
+    input_text,
+    result,
+    status="processed"
+):
+
+    model_used = result.get(
+        "_model_used",
+        "unknown"
+    )
+
+    with get_db_connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO requests (
+                created_at,
+                input_text,
+                summary,
+                intent,
+                category,
+                priority,
+                route,
+                action,
+                reason,
+                missing_information,
+                required_tools,
+                approval_required,
+                execution_result,
+                model_used,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now().isoformat(
+                    timespec="seconds"
+                ),
+                input_text,
+                result.get("summary", ""),
+                result.get("intent", ""),
+                result.get("category", ""),
+                result.get("priority", "medium"),
+                result.get("route", ""),
+                result.get("action", ""),
+                result.get("reason", ""),
+                json.dumps(
+                    result.get(
+                        "missing_information",
+                        []
+                    )
+                ),
+                json.dumps(
+                    result.get(
+                        "required_tools",
+                        []
+                    )
+                ),
+                1 if result.get(
+                    "approval_required",
+                    False
+                ) else 0,
+                result.get(
+                    "execution_result",
+                    ""
+                ),
+                model_used,
+                status
+            )
+        )
+
+        request_id = cursor.lastrowid
+
+        conn.commit()
+
+    return request_id
 
 
-# =============================================================================
-# 6. SIDEBAR
-# =============================================================================
+# ============================================================
+# APPROVAL QUEUE
+# ============================================================
 
-with st.sidebar:
+def create_approval(request_id):
 
-    st.header("⚙️ Settings & Key")
+    with get_db_connection() as conn:
 
-    # Try Streamlit Secret first
-    secret_key_exists = False
+        cursor = conn.cursor()
 
-    try:
-        secret_key_exists = bool(
-            st.secrets.get(
-                "GEMINI_API_KEY",
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                request_id,
+                created_at,
+                decision,
+                reviewer,
+                comment
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                datetime.now().isoformat(
+                    timespec="seconds"
+                ),
+                "pending",
+                "",
                 ""
             )
         )
-    except Exception:
-        secret_key_exists = False
 
-    if secret_key_exists:
+        conn.commit()
+
+
+def get_pending_approvals():
+
+    with get_db_connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                a.id,
+                a.request_id,
+                a.created_at,
+                r.summary,
+                r.priority,
+                r.action,
+                r.reason,
+                r.input_text
+            FROM approvals a
+            JOIN requests r
+                ON a.request_id = r.id
+            WHERE a.decision = 'pending'
+            ORDER BY a.id DESC
+            """
+        )
+
+        return cursor.fetchall()
+
+
+def update_approval(
+    approval_id,
+    request_id,
+    decision,
+    reviewer,
+    comment
+):
+
+    with get_db_connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            UPDATE approvals
+            SET
+                decision = ?,
+                reviewer = ?,
+                comment = ?
+            WHERE id = ?
+            """,
+            (
+                decision,
+                reviewer,
+                comment,
+                approval_id
+            )
+        )
+
+        cursor.execute(
+            """
+            UPDATE requests
+            SET status = ?
+            WHERE id = ?
+            """,
+            (
+                "approved"
+                if decision == "approved"
+                else "rejected",
+                request_id
+            )
+        )
+
+        conn.commit()
+
+    log_activity(
+        "HUMAN_DECISION",
+        (
+            f"Request #{request_id} "
+            f"was {decision} by {reviewer or 'reviewer'}."
+        ),
+        request_id
+    )
+
+
+# ============================================================
+# DATABASE HISTORY
+# ============================================================
+
+def get_request_history(limit=50):
+
+    with get_db_connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                created_at,
+                summary,
+                priority,
+                route,
+                status,
+                model_used
+            FROM requests
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,)
+        )
+
+        return cursor.fetchall()
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.title("⚙️ Settings & Key")
+
+    api_key = get_gemini_api_key()
+
+    if api_key:
 
         st.success(
             "Gemini API key loaded from Streamlit Secrets."
@@ -603,79 +833,73 @@ with st.sidebar:
 
     else:
 
-        manual_key = st.text_input(
-            "Enter Gemini API Key",
-            type="password",
-            help="Used only for this running application."
+        st.error(
+            "Gemini API key is not configured."
         )
 
-        st.session_state[
-            "manual_gemini_api_key"
-        ] = manual_key
+        st.info(
+            "Add GEMINI_API_KEY in Streamlit Cloud → "
+            "Manage app → Settings → Secrets."
+        )
 
-    st.markdown("---")
+    st.divider()
 
-    st.header("🤖 AI Configuration")
+    st.subheader("🤖 AI Configuration")
 
     st.caption(
-        f"Model: `{GEMINI_MODEL}`"
+        "Primary model:"
+    )
+
+    st.code(
+        GEMINI_MODELS[0],
+        language="text"
+    )
+
+    st.caption(
+        "Automatic fallback:"
+    )
+
+    st.code(
+        " → ".join(GEMINI_MODELS),
+        language="text"
     )
 
     st.caption(
         "Google GenAI SDK"
     )
 
-    st.markdown("---")
+    st.divider()
 
-    st.header("📜 Live Activity Trace")
+    st.subheader("📡 Live Activity Trace")
 
-    try:
+    logs = get_activity_logs(
+        limit=20
+    )
 
-        with get_db_connection() as conn:
+    if logs:
 
-            logs = conn.execute(
-                """
-                SELECT
-                    timestamp,
-                    event_type,
-                    details
-                FROM activity_logs
-                ORDER BY id DESC
-                LIMIT 15
-                """
-            ).fetchall()
+        for created_at, event_type, message in logs:
 
-    except Exception as e:
+            st.markdown(
+                f"""
+**[{created_at}] {event_type}**
 
-        logs = []
+{message}
+"""
+            )
 
-        st.error(
-            f"Could not load activity logs: {e}"
-        )
+            st.divider()
 
-    if not logs:
+    else:
 
         st.caption(
             "No activity yet."
         )
 
-    else:
 
-        for log in logs:
-
-            timestamp = log[0]
-            event_type = log[1]
-            details = log[2]
-
-            st.caption(
-                f"**[{timestamp}] {event_type}**\n"
-                f"{details}"
-            )
-
-
-# =============================================================================
-# 7. MAIN HEADER
-# =============================================================================
+# ============================================================
+# HEADER
+# ============================================================
 
 st.title(
     "⚡ Agentic Work Intake & Execution Prototype"
@@ -686,11 +910,11 @@ st.caption(
 )
 
 
-# =============================================================================
-# 8. TABS
-# =============================================================================
+# ============================================================
+# TABS
+# ============================================================
 
-tab_intake, tab_pending, tab_history = st.tabs(
+tab_intake, tab_approval, tab_history = st.tabs(
     [
         "📥 Intake & Processing",
         "⏸️ Pending Human Approvals",
@@ -699,771 +923,552 @@ tab_intake, tab_pending, tab_history = st.tabs(
 )
 
 
-# =============================================================================
-# TAB 1 — INTAKE & PROCESSING
-# =============================================================================
+# ============================================================
+# TAB 1: INTAKE
+# ============================================================
 
 with tab_intake:
 
-    st.subheader(
+    st.header(
         "1. Submit Unstructured Work"
     )
 
-    user_text = st.text_area(
+    st.write(
+        "Paste an email, meeting note, customer request, "
+        "or founder instruction."
+    )
+
+    default_text = """
+Dear Altibbe Health Team,
+
+Thank you for the update.
+
+I understand the location requirement. I would like to confirm
+that I am willing to relocate to Raidurg, Hyderabad, and I will
+be able to maintain a sustainable daily commute to T-Hub.
+
+Please let me know the next steps.
+""".strip()
+
+    input_text = st.text_area(
         "Paste email, meeting notes, customer request, or founder instruction:",
+        value=default_text,
         height=180,
-        placeholder=(
-            "Example:\n"
-            "Please check whether example.com is reachable "
-            "and draft an email to the team summarizing the result."
-        )
+        key="intake_text"
     )
 
-    submit_button = st.button(
+    submit = st.button(
         "🚀 Submit to Agent",
-        type="primary"
+        type="primary",
+        use_container_width=False
     )
 
-    if submit_button:
+    if submit:
 
-        api_key = get_api_key()
-
-        # ---------------------------------------------------------------------
-        # Validation
-        # ---------------------------------------------------------------------
-
-        if not api_key:
-
-            st.error(
-                "Please provide your Gemini API key."
-            )
-
-        elif not user_text.strip():
+        if not input_text.strip():
 
             st.warning(
-                "Please provide some unstructured work input."
+                "Please enter some work/request text."
+            )
+
+        elif not api_key:
+
+            st.error(
+                "Gemini API key is not configured."
             )
 
         else:
 
             log_activity(
                 "INTAKE_RECEIVED",
-                f"Text snippet: {user_text[:120]}..."
+                f"Text length: {len(input_text)} characters"
             )
 
             with st.spinner(
-                "🤖 AI Engine Analyzing & Planning..."
+                "Agent is analyzing and routing the work..."
             ):
 
                 try:
 
-                    # ---------------------------------------------------------
-                    # Gemini planning
-                    # ---------------------------------------------------------
-
-                    analysis = process_intake_with_llm(
-                        user_text,
+                    result = process_intake_with_llm(
+                        input_text,
                         api_key
                     )
 
-                    # ---------------------------------------------------------
-                    # Store request
-                    # ---------------------------------------------------------
+                    route = result.get(
+                        "route",
+                        "requires_clarification"
+                    )
 
-                    with get_db_connection() as conn:
+                    # ------------------------------------------------
+                    # Automatic execution
+                    # ------------------------------------------------
 
-                        cursor = conn.cursor()
+                    if route == "execute_automatically":
 
-                        cursor.execute(
-                            """
-                            INSERT INTO requests
-                            (raw_text, structured_json)
-                            VALUES (?, ?)
-                            """,
-                            (
-                                user_text,
-                                json.dumps(
-                                    analysis,
-                                    ensure_ascii=False
-                                )
+                        execution_result = (
+                            execute_available_tools(
+                                input_text,
+                                result
                             )
                         )
 
-                        request_id = cursor.lastrowid
-
-                        log_activity(
-                            "LLM_PARSED",
-                            (
-                                f"Parsed task: "
-                                f"{analysis.get('task_title')}"
-                            ),
-                            cursor=cursor
+                        result["execution_result"] = (
+                            execution_result
                         )
 
-                        # -----------------------------------------------------
-                        # Process every planned action
-                        # -----------------------------------------------------
+                        status = "executed"
 
-                        actions = analysis.get(
-                            "actions",
-                            []
+                    # ------------------------------------------------
+                    # Human approval
+                    # ------------------------------------------------
+
+                    elif route == "prepare_for_human_review":
+
+                        result["execution_result"] = (
+                            "Execution paused until human approval."
                         )
 
-                        for action in actions:
+                        status = "pending_approval"
 
-                            action_title = action.get(
-                                "action_title",
-                                "Untitled Action"
-                            )
+                    # ------------------------------------------------
+                    # Missing tools
+                    # ------------------------------------------------
 
-                            tool = action.get(
-                                "tool_to_use",
-                                "none"
-                            )
+                    elif route == "cannot_execute_with_tools":
 
-                            category = action.get(
-                                "routing_category",
-                                "requires_clarification"
-                            )
+                        result["execution_result"] = (
+                            "Execution stopped because "
+                            "the required capability is unavailable."
+                        )
 
-                            reason = action.get(
-                                "reason",
-                                ""
-                            )
+                        status = "blocked"
 
-                            params = action.get(
-                                "parameters",
-                                {}
-                            )
+                    # ------------------------------------------------
+                    # Clarification
+                    # ------------------------------------------------
 
-                            # =================================================
-                            # AUTOMATIC EXECUTION
-                            # =================================================
+                    else:
 
-                            if category == "execute_automatically":
+                        result["execution_result"] = (
+                            "Execution paused because "
+                            "additional information is required."
+                        )
 
-                                if tool == "check_website_status":
+                        status = "needs_clarification"
 
-                                    result = execute_action(
-                                        tool,
-                                        params
-                                    )
+                    # Save request
+                    request_id = save_request(
+                        input_text,
+                        result,
+                        status
+                    )
 
-                                    status = "COMPLETED"
+                    # Create approval item if needed
+                    if route == "prepare_for_human_review":
 
-                                    log_activity(
-                                        "AUTO_EXECUTED",
-                                        (
-                                            f"Tool: {tool} | "
-                                            f"Result: {result}"
-                                        ),
-                                        cursor=cursor
-                                    )
+                        create_approval(
+                            request_id
+                        )
 
-                                else:
-
-                                    result = json.dumps({
-                                        "status": "NOT_EXECUTED",
-                                        "reason": (
-                                            "Tool is not configured "
-                                            "for automatic execution."
-                                        )
-                                    })
-
-                                    status = "FLAGGED"
-
-                                    log_activity(
-                                        "AUTO_EXECUTION_BLOCKED",
-                                        (
-                                            f"Tool: {tool} | "
-                                            f"Action: {action_title}"
-                                        ),
-                                        cursor=cursor
-                                    )
-
-                            # =================================================
-                            # HUMAN APPROVAL
-                            # =================================================
-
-                            elif category == "prepare_for_human_review":
-
-                                # Store the actual parameters inside output.
-                                # This allows the approval button to execute
-                                # the action with the data Gemini extracted.
-                                pending_payload = {
-                                    "status": "PENDING_APPROVAL",
-                                    "tool": tool,
-                                    "parameters": params
-                                }
-
-                                result = json.dumps(
-                                    pending_payload,
-                                    ensure_ascii=False
-                                )
-
-                                status = "PENDING_APPROVAL"
-
-                                log_activity(
-                                    "ROUTED_HITL",
-                                    (
-                                        f"Action '{action_title}' "
-                                        f"paused for human review."
-                                    ),
-                                    cursor=cursor
-                                )
-
-                            # =================================================
-                            # FLAGGED
-                            # =================================================
-
-                            else:
-
-                                result = json.dumps({
-                                    "status": "FLAGGED",
-                                    "routing_category": category,
-                                    "reason": reason
-                                })
-
-                                status = "FLAGGED"
-
-                                log_activity(
-                                    "ROUTED_FLAGGED",
-                                    (
-                                        f"Action: {action_title} "
-                                        f"-> {category}"
-                                    ),
-                                    cursor=cursor
-                                )
-
-                            # -------------------------------------------------
-                            # Save action
-                            # -------------------------------------------------
-
-                            cursor.execute(
-                                """
-                                INSERT INTO actions
-                                (
-                                    request_id,
-                                    action_title,
-                                    action_type,
-                                    routing_category,
-                                    reason,
-                                    status,
-                                    output
-                                )
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    request_id,
-                                    action_title,
-                                    tool,
-                                    category,
-                                    reason,
-                                    status,
-                                    result
-                                )
-                            )
-
-                        conn.commit()
-
-                    # ---------------------------------------------------------
-                    # Success UI
-                    # ---------------------------------------------------------
+                    log_activity(
+                        "ROUTED",
+                        (
+                            f"Request #{request_id} routed to "
+                            f"{route}."
+                        ),
+                        request_id
+                    )
 
                     st.success(
                         "✅ Work processed and routed successfully!"
                     )
 
+                    # ------------------------------------------------
+                    # Agent analysis
+                    # ------------------------------------------------
+
+                    st.header(
+                        "2. Agent Analysis"
+                    )
+
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+
+                        st.metric(
+                            "Priority",
+                            result.get(
+                                "priority",
+                                "medium"
+                            ).upper()
+                        )
+
+                    with col2:
+
+                        st.metric(
+                            "Route",
+                            route.replace(
+                                "_",
+                                " "
+                            ).title()
+                        )
+
+                    with col3:
+
+                        st.metric(
+                            "Approval",
+                            "Required"
+                            if result.get(
+                                "approval_required",
+                                False
+                            )
+                            else "Not Required"
+                        )
+
                     st.subheader(
-                        "Agent Analysis"
+                        "📋 Summary"
                     )
 
-                    st.json(
-                        analysis
+                    st.write(
+                        result.get(
+                            "summary",
+                            ""
+                        )
                     )
 
-                    # Show summary
                     st.subheader(
-                        "Execution Summary"
+                        "🎯 Intent"
                     )
 
-                    actions = analysis.get(
-                        "actions",
+                    st.write(
+                        result.get(
+                            "intent",
+                            ""
+                        )
+                    )
+
+                    st.subheader(
+                        "🏷️ Category"
+                    )
+
+                    st.write(
+                        result.get(
+                            "category",
+                            ""
+                        )
+                    )
+
+                    st.subheader(
+                        "🧭 Routing Decision"
+                    )
+
+                    st.info(
+                        result.get(
+                            "reason",
+                            ""
+                        )
+                    )
+
+                    st.subheader(
+                        "⚡ Recommended Action"
+                    )
+
+                    st.write(
+                        result.get(
+                            "action",
+                            ""
+                        )
+                    )
+
+                    missing = result.get(
+                        "missing_information",
                         []
                     )
 
-                    if actions:
+                    if missing:
 
-                        for index, action in enumerate(
-                            actions,
-                            start=1
-                        ):
-
-                            category = action.get(
-                                "routing_category"
-                            )
-
-                            if category == "execute_automatically":
-                                icon = "🟢"
-
-                            elif category == "prepare_for_human_review":
-                                icon = "🟡"
-
-                            elif category == "requires_clarification":
-                                icon = "🟠"
-
-                            else:
-                                icon = "🔴"
-
-                            st.write(
-                                f"{icon} **{index}. "
-                                f"{action.get('action_title')}** — "
-                                f"`{category}`"
-                            )
-
-                    else:
-
-                        st.info(
-                            "No actions were detected."
+                        st.subheader(
+                            "❓ Missing Information"
                         )
 
-                except Exception as e:
+                        for item in missing:
 
-                    error_message = str(e)
+                            st.warning(
+                                item
+                            )
 
-                    st.error(
-                        f"❌ Execution Error: {error_message}"
+                    tools = result.get(
+                        "required_tools",
+                        []
                     )
+
+                    if tools:
+
+                        st.subheader(
+                            "🛠️ Required Tools"
+                        )
+
+                        for tool in tools:
+
+                            st.write(
+                                f"- {tool}"
+                            )
+
+                    st.subheader(
+                        "▶️ Execution Result"
+                    )
+
+                    st.write(
+                        result.get(
+                            "execution_result",
+                            ""
+                        )
+                    )
+
+                    st.caption(
+                        "Model used: "
+                        + result.get(
+                            "_model_used",
+                            "unknown"
+                        )
+                    )
+
+                    st.subheader(
+                        "🔎 Raw Structured Agent Output"
+                    )
+
+                    clean_result = {
+                        key: value
+                        for key, value in result.items()
+                        if key != "_model_used"
+                    }
+
+                    st.json(
+                        clean_result
+                    )
+
+                except Exception as error:
 
                     log_activity(
                         "FAILURE_PATH",
-                        (
-                            f"Error encountered: "
-                            f"{error_message}"
-                        )
+                        f"Error encountered: {error}"
+                    )
+
+                    st.error(
+                        "Execution Error"
+                    )
+
+                    st.code(
+                        str(error)
+                    )
+
+                    st.info(
+                        "If this is a temporary Gemini 503/429 error, "
+                        "wait a short time and try again. "
+                        "The application automatically retries "
+                        "temporary failures and falls back between "
+                        "supported Gemini models."
                     )
 
 
-# =============================================================================
-# TAB 2 — HUMAN-IN-THE-LOOP APPROVAL
-# =============================================================================
+# ============================================================
+# TAB 2: HUMAN APPROVALS
+# ============================================================
 
-with tab_pending:
+with tab_approval:
 
-    st.subheader(
-        "2. Human-in-the-Loop Approval Queue"
+    st.header(
+        "⏸️ Pending Human Approvals"
     )
 
-    try:
+    approvals = get_pending_approvals()
 
-        with get_db_connection() as conn:
+    if not approvals:
 
-            pending_actions = conn.execute(
-                """
-                SELECT
-                    id,
-                    action_title,
-                    action_type,
-                    reason,
-                    output
-                FROM actions
-                WHERE status = 'PENDING_APPROVAL'
-                ORDER BY id DESC
-                """
-            ).fetchall()
-
-    except Exception as e:
-
-        pending_actions = []
-
-        st.error(
-            f"Could not load pending actions: {e}"
-        )
-
-    if not pending_actions:
-
-        st.info(
-            "No actions currently waiting for approval."
+        st.success(
+            "No pending human approvals."
         )
 
     else:
 
         st.write(
-            f"**{len(pending_actions)} action(s) waiting for approval.**"
+            f"{len(approvals)} request(s) waiting for review."
         )
 
-        for (
-            act_id,
-            title,
-            tool_type,
-            reason,
-            output
-        ) in pending_actions:
+        for approval in approvals:
+
+            (
+                approval_id,
+                request_id,
+                created_at,
+                summary,
+                priority,
+                action,
+                reason,
+                original_text
+            ) = approval
 
             with st.expander(
-                f"🔴 Pending: {title}",
-                expanded=True
+                f"Request #{request_id} • {priority.upper()} • {summary}"
             ):
 
                 st.write(
-                    f"**Action ID:** `{act_id}`"
+                    "**Created:**",
+                    created_at
                 )
 
                 st.write(
-                    f"**Tool:** `{tool_type}`"
+                    "**Reason for review:**"
+                )
+
+                st.info(
+                    reason
                 )
 
                 st.write(
-                    f"**Reason for Review:** {reason}"
+                    "**Proposed action:**"
                 )
 
-                # -------------------------------------------------------------
-                # Decode the parameters Gemini extracted
-                # -------------------------------------------------------------
-
-                pending_data = safe_json_loads(
-                    output,
-                    {}
+                st.write(
+                    action
                 )
 
-                params = pending_data.get(
-                    "parameters",
-                    {}
+                st.write(
+                    "**Original request:**"
                 )
 
-                if params:
+                st.text_area(
+                    "Original text",
+                    value=original_text,
+                    height=150,
+                    disabled=True,
+                    key=f"original_{approval_id}"
+                )
 
-                    st.write(
-                        "**Parameters:**"
-                    )
+                reviewer = st.text_input(
+                    "Reviewer name",
+                    key=f"reviewer_{approval_id}"
+                )
 
-                    st.json(
-                        params
-                    )
-
-                else:
-
-                    st.warning(
-                        "No stored parameters were found."
-                    )
+                comment = st.text_area(
+                    "Reviewer comment",
+                    key=f"comment_{approval_id}"
+                )
 
                 col1, col2 = st.columns(2)
 
-                # =============================================================
-                # APPROVE
-                # =============================================================
-
                 with col1:
 
-                    approve_button = st.button(
-                        "✅ Approve & Execute",
-                        key=f"approve_{act_id}",
-                        type="primary"
-                    )
+                    if st.button(
+                        "✅ Approve",
+                        key=f"approve_{approval_id}",
+                        use_container_width=True
+                    ):
 
-                    if approve_button:
+                        update_approval(
+                            approval_id,
+                            request_id,
+                            "approved",
+                            reviewer,
+                            comment
+                        )
 
-                        try:
+                        st.success(
+                            "Request approved."
+                        )
 
-                            # ---------------------------------------------
-                            # Execute using the ORIGINAL Gemini parameters
-                            # ---------------------------------------------
-
-                            exec_res = execute_action(
-                                tool_type,
-                                params
-                            )
-
-                            # ---------------------------------------------
-                            # Update database
-                            # ---------------------------------------------
-
-                            with get_db_connection() as conn:
-
-                                conn.execute(
-                                    """
-                                    UPDATE actions
-                                    SET
-                                        status = ?,
-                                        output = ?
-                                    WHERE id = ?
-                                    """,
-                                    (
-                                        "APPROVED_AND_EXECUTED",
-                                        exec_res,
-                                        act_id
-                                    )
-                                )
-
-                                conn.commit()
-
-                            log_activity(
-                                "HITL_APPROVED",
-                                (
-                                    f"Action ID {act_id} "
-                                    f"approved and executed. "
-                                    f"Tool: {tool_type}"
-                                )
-                            )
-
-                            st.success(
-                                "✅ Action approved and executed."
-                            )
-
-                            st.rerun()
-
-                        except Exception as e:
-
-                            st.error(
-                                f"Execution failed: {e}"
-                            )
-
-                            log_activity(
-                                "HITL_EXECUTION_FAILED",
-                                (
-                                    f"Action ID {act_id}: "
-                                    f"{str(e)}"
-                                )
-                            )
-
-                # =============================================================
-                # REJECT
-                # =============================================================
+                        st.rerun()
 
                 with col2:
 
-                    reject_button = st.button(
+                    if st.button(
                         "❌ Reject",
-                        key=f"reject_{act_id}"
-                    )
+                        key=f"reject_{approval_id}",
+                        use_container_width=True
+                    ):
 
-                    if reject_button:
+                        update_approval(
+                            approval_id,
+                            request_id,
+                            "rejected",
+                            reviewer,
+                            comment
+                        )
 
-                        try:
+                        st.warning(
+                            "Request rejected."
+                        )
 
-                            with get_db_connection() as conn:
-
-                                conn.execute(
-                                    """
-                                    UPDATE actions
-                                    SET
-                                        status = ?,
-                                        output = ?
-                                    WHERE id = ?
-                                    """,
-                                    (
-                                        "REJECTED",
-                                        "Rejected by human operator.",
-                                        act_id
-                                    )
-                                )
-
-                                conn.commit()
-
-                            log_activity(
-                                "HITL_REJECTED",
-                                (
-                                    f"Action ID {act_id} "
-                                    f"rejected by human."
-                                )
-                            )
-
-                            st.warning(
-                                "Action rejected."
-                            )
-
-                            st.rerun()
-
-                        except Exception as e:
-
-                            st.error(
-                                f"Could not reject action: {e}"
-                            )
+                        st.rerun()
 
 
-# =============================================================================
-# TAB 3 — DATABASE HISTORY
-# =============================================================================
+# ============================================================
+# TAB 3: DATABASE HISTORY
+# ============================================================
 
 with tab_history:
 
-    st.subheader(
-        "3. Persistent Storage (SQLite Records)"
+    st.header(
+        "📊 Database History"
     )
 
-    try:
+    history = get_request_history(
+        limit=50
+    )
 
-        with get_db_connection() as conn:
-
-            requests_df = conn.execute(
-                """
-                SELECT
-                    id,
-                    raw_text,
-                    timestamp,
-                    structured_json
-                FROM requests
-                ORDER BY id DESC
-                """
-            ).fetchall()
-
-    except Exception as e:
-
-        requests_df = []
-
-        st.error(
-            f"Could not load database history: {e}"
-        )
-
-    if not requests_df:
+    if not history:
 
         st.info(
-            "No requests have been processed yet."
+            "No requests have been stored yet."
         )
 
     else:
 
-        for req in requests_df:
+        for row in history:
 
-            request_id = req[0]
-            raw_text = req[1]
-            timestamp = req[2]
-            structured_json = req[3]
+            (
+                request_id,
+                created_at,
+                summary,
+                priority,
+                route,
+                status,
+                model_used
+            ) = row
 
             with st.expander(
-                f"📌 Request ID #{request_id} — {timestamp}"
+                f"#{request_id} • {priority.upper()} • {status}"
             ):
 
                 st.write(
-                    "**Raw Input:**"
-                )
-
-                st.text(
-                    raw_text
+                    f"**Created:** {created_at}"
                 )
 
                 st.write(
-                    "**Structured Agent Output:**"
+                    f"**Summary:** {summary}"
                 )
 
-                try:
+                st.write(
+                    f"**Route:** {route}"
+                )
 
-                    st.json(
-                        json.loads(structured_json)
-                    )
+                st.write(
+                    f"**Status:** {status}"
+                )
 
-                except Exception:
-
-                    st.text(
-                        structured_json
-                    )
-
-                # -------------------------------------------------------------
-                # Actions for this request
-                # -------------------------------------------------------------
-
-                try:
-
-                    with get_db_connection() as conn:
-
-                        acts = conn.execute(
-                            """
-                            SELECT
-                                id,
-                                action_title,
-                                action_type,
-                                routing_category,
-                                reason,
-                                status,
-                                output
-                            FROM actions
-                            WHERE request_id = ?
-                            ORDER BY id ASC
-                            """,
-                            (request_id,)
-                        ).fetchall()
-
-                except Exception as e:
-
-                    acts = []
-
-                    st.error(
-                        f"Could not load actions: {e}"
-                    )
-
-                if acts:
-
-                    st.write(
-                        "**Actions:**"
-                    )
-
-                    for act in acts:
-
-                        (
-                            action_id,
-                            action_title,
-                            action_type,
-                            routing_category,
-                            reason,
-                            status,
-                            output
-                        ) = act
-
-                        st.markdown(
-                            f"### {action_title}"
-                        )
-
-                        st.write(
-                            f"**Action ID:** `{action_id}`"
-                        )
-
-                        st.write(
-                            f"**Tool:** `{action_type}`"
-                        )
-
-                        st.write(
-                            f"**Routing:** `{routing_category}`"
-                        )
-
-                        st.write(
-                            f"**Status:** `{status}`"
-                        )
-
-                        st.write(
-                            f"**Reason:** {reason}"
-                        )
-
-                        st.write(
-                            "**Output:**"
-                        )
-
-                        try:
-
-                            st.json(
-                                json.loads(output)
-                            )
-
-                        except Exception:
-
-                            st.text(
-                                output
-                            )
-
-                else:
-
-                    st.info(
-                        "No actions stored for this request."
-                    )
+                st.write(
+                    f"**Model:** {model_used}"
+                )
 
 
-# =============================================================================
+# ============================================================
 # FOOTER
-# =============================================================================
+# ============================================================
 
-st.markdown("---")
+st.divider()
 
 st.caption(
-    "Agentic Work Intake Prototype • "
-    f"Powered by {GEMINI_MODEL} • "
-    "SQLite Persistence • Human-in-the-Loop"
+    "Agentic Work Intake & Execution Prototype • "
+    "Gemini API • SQLite • Streamlit"
 )
